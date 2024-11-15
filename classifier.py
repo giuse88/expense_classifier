@@ -1,86 +1,70 @@
-from textblob.classifiers import NaiveBayesClassifier
-from textblob import TextBlob
-import sys
-import glob
-import csv
+import click
+import pandas as pd
+from utils.ml import load_models, categorize
 
-DESCRIPTION = 5
-CATEGORY = 2
-AVOIDABLE = 3
-ORDINARY = 4
 
-def norm(string):
-    return string.replace(',', '').replace("'", '')
+def parse_natwest_csv(file_path):
+    def check_payment(txt):
+        return 'AMERICAN EXP 3773' in txt.upper()
 
-class ExpenseClassifier:
+    data = pd.read_csv(file_path)
+    data['Date'] = pd.to_datetime(data['Date'])
+    mask = data['Description'].apply(check_payment)
+    data = data[~mask]
+    data['Card'] = 'NATWEST'
+    return data[['Date', 'Description', 'Value', 'Card']].rename({'Value': 'Amount'}, axis=1)
 
-    def __init__(self):
-        training_data = self._load_data("data")
-        self.category_classifier  = NaiveBayesClassifier([(x[0], x[1]) for x in  training_data])
-        self.avoidability_classifier = NaiveBayesClassifier([(x[0], x[2]) for x in  training_data])
-        self.ordinary_classifier =  NaiveBayesClassifier([(x[0], x[3]) for x in  training_data])
 
-    def classify(self, description):
-        res = {}
-        res['category'] = self.category_classifier.classify(description)
-        res['avoidable'] = self.avoidability_classifier.classify(description)
-        res['ordinary'] = self.ordinary_classifier.classify(description)
-        return res
+def parse_amex_xlsx(file_path):
+    def check_payment(txt):
+        return 'PAYMENT RECEIVED' in txt.upper()
 
-    def accuracy(self):
-        test_data = self._load_data("test")
-        res = {}
-        res['category'] = self.category_classifier.accuracy([(x[0], x[1]) for x in test_data])
-        res['avoidable'] = self.avoidability_classifier.accuracy([(x[0], x[2]) for x in test_data])
-        res['ordinary'] = self.ordinary_classifier.accuracy([(x[0], x[3]) for x in test_data])
-        return res
+    df= pd.read_csv(file_path)
+    df['Date'] = pd.to_datetime(df['Date'])
+    df['Amount'] = df['Amount'] * -1
+    mask = (df['Amount'] > 0) & df['Description'].apply(check_payment)
+    df = df[~mask]
+    df['Card'] = 'AMEX'
+    return df[['Date', 'Description', 'Amount', 'Card']]
 
-    def _load_data(self, folder):
-        data = []
-        for f in glob.glob(folder + "/*.csv"):
-            with open(f) as csvfile:
-                spamreader = csv.reader(csvfile, delimiter=',')
-                for row in spamreader:
-                    if row[DESCRIPTION] and row[CATEGORY] and row[AVOIDABLE] and row[ORDINARY]:
-                        data.append((norm(row[DESCRIPTION]), row[CATEGORY], row[AVOIDABLE], row[ORDINARY]))
-        return data
 
-class CSVEnricher:
-    _data = []
-    _enriched_data = []
+@click.command()
+@click.option('--natwest', type=click.File('r'), required=False, help="Path to NatWest file (optional).")
+@click.option('--amex', type=click.File('r'), required=False, help="Path to Amex file (optional).")
+def process_files(natwest, amex):
+    """Process NatWest and Amex files if provided."""
+    natwest_content = None
+    amex_content = None
+    data = []
 
-    def __init__(self, file_name):
+    if natwest:
+        click.echo("Processing NatWest file...")
+        natwest_content = parse_natwest_csv(natwest)
+    else:
+        click.echo("NatWest file not provided.")
 
-        with open(file_name) as csvfile:
-            csvreader = csv.reader(csvfile, delimiter=',')
-            for row in csvreader:
-                row[2] = norm(row[2])
-                print(row[2])
-                self._data.append(row)
-        self.cl = ExpenseClassifier()
+    if amex:
+        click.echo("Processing Amex file...")
+        amex_content = parse_amex_xlsx(amex)
+    else:
+        click.echo("Amex file not provided.")
 
-    def enrich(self):
-        for row in self._data[2:]:
-            if len(row) < 3:
-               continue
-            else:
-                res = self.cl.classify(row[2])
-                self._enriched_data.append(row[0:2] + [res['category'], res['avoidable'], res['ordinary']] + row[2:])
+    if natwest_content is not None:
+        data.append(natwest_content)
 
-    def writeTo(self, file_name):
-        with open(file_name, 'wb') as csvfile:
-            writer = csv.writer(csvfile, delimiter=',')
-            for row in self._enriched_data:
-                writer.writerow(row)
+    if amex_content is not None:
+        data.append(amex_content)
 
-def print_data(data):
-    for x in data:
-        print(x)
+    if len(data) == 0:
+        click.echo('You must pass at least one file')
+        exit(-1)
 
-def main():
-    enricher = CSVEnricher(sys.argv[1])
-    enricher.enrich()
-    enricher.writeTo("res.csv")
+    data = pd.concat([natwest_content, amex_content])
 
-if __name__ == "__main__":
-    main()
+    ml, le = load_models()
+    data['Category'] = categorize(data, model=ml, le=le)
+    print(data.set_index('Date'))
+
+
+if __name__ == '__main__':
+    process_files()
